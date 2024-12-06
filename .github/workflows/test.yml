@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Check out repository code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Set up sccache (part 1)
         uses: mozilla-actions/sccache-action@v0.0.3
         with:
