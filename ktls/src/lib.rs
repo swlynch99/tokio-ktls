@@ -25,7 +25,7 @@ use tokio::{
 };
 
 mod ffi;
-use crate::ffi::CryptoInfo;
+pub use crate::ffi::CryptoInfo;
 
 mod async_read_ready;
 pub use async_read_ready::AsyncReadReady;
