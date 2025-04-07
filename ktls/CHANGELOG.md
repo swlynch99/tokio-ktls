@@ -1,5 +1,12 @@
 # Changelog
 
+## [6.0.2](https://github.com/rustls/ktls/compare/ktls-v6.0.1...ktls-v6.0.2) - 2025-04-07
+
+### Other
+
+- Make CryptoInfo public to enable asynchronous kTLS setup via io-uring or any mechanism other
+  than ktls's default synchronous `setsockopt` call, cf. <https://github.com/rustls/ktls/pull/54>
+
 ## [6.0.1](https://github.com/rustls/ktls/compare/ktls-v6.0.0...ktls-v6.0.1) - 2024-09-26
 
 ### Other
