@@ -22,12 +22,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools, clippy, rust-src
-      - name: Set up sccache (part 1)
-        uses: mozilla-actions/sccache-action@v0.0.3
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Set up sccache (part 2)
-        run: sccache --start-server
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
       - uses: taiki-e/install-action@v2
         with:
           tool: just,cargo-llvm-cov,cargo-nextest
@@ -52,12 +48,8 @@ jobs:
         with:
           toolchain: 1.75.0
           components: llvm-tools, clippy, rust-src
-      - name: Set up sccache (part 1)
-        uses: mozilla-actions/sccache-action@v0.0.3
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Set up sccache (part 2)
-        run: sccache --start-server
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
       - uses: taiki-e/install-action@v2
         with:
           tool: just
