@@ -14,7 +14,7 @@ rust-version = "1.75"
 
 [dependencies]
 libc = { version = "0.2.155", features = ["const-extern-fn"] }
-thiserror = "1.0.63"
+thiserror = "2"
 tracing = "0.1.40"
 tokio-rustls = { default-features = false, version = "0.26.0" }
 rustls = { version = "0.23.12", default-features = false }
@@ -33,7 +33,6 @@ oorandom = "11.1.4"
 rcgen = "0.13.1"
 socket2 = "0.5.7"
 test-case = "3.3.1"
-thiserror = "1.0.63"
 tokio = { version = "1.39.2", features = ["full"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 
