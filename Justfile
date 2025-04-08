@@ -32,3 +32,6 @@ c *args:
 check:
 	cargo clippy --no-default-features --features tls12,ring --all-targets
 	cargo clippy --no-default-features --features tls12,aws_lc_rs --all-targets
+
+hack-check:
+    cargo hack check --locked --lib --feature-powerset --mutually-exclusive-features aws-lc-rs,ring --at-least-one-of aws-lc-rs,ring --exclude-features aws_lc_rs
