@@ -60,7 +60,7 @@ jobs:
               run: sccache --start-server
             - uses: taiki-e/install-action@v2
               with:
-                  tool: cargo-hack
+                  tool: just
             - name: Check library code with minimum supported Rust version
               run: |
                   just check
