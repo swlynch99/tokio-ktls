@@ -58,4 +58,4 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Set up sccache (part 2)
         run: sccache --start-server
-      - run: cargo check --lib
+      - run: cargo check --locked --lib --all-features
