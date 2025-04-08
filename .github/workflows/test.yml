@@ -63,4 +63,4 @@ jobs:
                   tool: cargo-hack
             - name: Check library code with minimum supported Rust version
               run: |
-                  cargo hack check --locked --lib --feature-powerset --mutually-exclusive-features aws-lc-rs,ring --at-least-one-of aws-lc-rs,ring --exclude-feature aws_lc_rs
+                  just check
