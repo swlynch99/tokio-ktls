@@ -19,6 +19,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools, clippy, rust-src
       - name: Set up sccache (part 1)
         uses: mozilla-actions/sccache-action@v0.0.3
         with:
@@ -35,6 +38,24 @@ jobs:
           RUST_BACKTRACE=1 just ci-test
       - name: Upload coverage information
         run: |
-          curl -Os https://uploader.codecov.io/latest/linux/codecov 
+          curl -Os https://uploader.codecov.io/latest/linux/codecov
           chmod +x codecov
           ./codecov
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.75.0
+          components: llvm-tools, clippy, rust-src
+      - name: Set up sccache (part 1)
+        uses: mozilla-actions/sccache-action@v0.0.3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up sccache (part 2)
+        run: sccache --start-server
+      - run: cargo check --lib
