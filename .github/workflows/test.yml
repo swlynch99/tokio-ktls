@@ -34,7 +34,7 @@ jobs:
             - name: Run tests
               run: |
                   cd ${{ github.workspace }}
-                  just check
+                  just check --all-targets
                   RUST_BACKTRACE=1 just ci-test
             - name: Upload coverage information
               run: |

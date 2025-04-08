@@ -29,6 +29,6 @@ test *args:
 c *args:
     just check {{args}}
 
-check:
-	cargo clippy --no-default-features --features tls12,ring --all-targets
-	cargo clippy --no-default-features --features tls12,aws_lc_rs --all-targets
+check *args:
+	cargo clippy {{args}} --no-default-features --features tls12,ring
+	cargo clippy {{args}} --no-default-features --features tls12,aws_lc_rs
