@@ -247,7 +247,7 @@ where
                 //
                 // we could try looping (tricky code structure), but we can't,
                 // for example, just call `poll_read`, which might fail not
-                // not with EAGAIN/EWOULDBLOCK, but because _another_ control
+                // with EAGAIN/EWOULDBLOCK, but because _another_ control
                 // message is available.
                 cx.waker().wake_by_ref();
                 return task::Poll::Pending;
