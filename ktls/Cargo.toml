@@ -17,7 +17,7 @@ libc = { version = "0.2.155", features = ["const-extern-fn"] }
 thiserror = "2"
 tracing = "0.1.40"
 tokio-rustls = { default-features = false, version = "0.26.0" }
-rustls = { version = "0.23.12", default-features = false }
+rustls = { version = "0.23.27", default-features = false }
 smallvec = "1.13.2"
 memoffset = "0.9.1"
 pin-project-lite = "0.2.14"

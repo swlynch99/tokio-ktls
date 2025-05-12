@@ -36,6 +36,10 @@ pub use ktls_stream::KtlsStream;
 mod cork_stream;
 pub use cork_stream::CorkStream;
 
+mod client;
+mod stream;
+mod protocol;
+
 #[derive(Debug, Default)]
 pub struct CompatibleCiphers {
     pub tls12: CompatibleCiphersForVersion,

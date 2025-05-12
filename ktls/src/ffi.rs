@@ -1,4 +1,4 @@
-use std::os::unix::prelude::RawFd;
+use std::{ffi::c_void, io, os::unix::prelude::RawFd};
 
 use ktls_sys::bindings as ktls;
 use rustls::{
@@ -243,15 +243,14 @@ const TLS_SET_RECORD_TYPE: libc::c_int = 1;
 const ALERT: u8 = 0x15;
 
 // Yes, really. cmsg components are aligned to [libc::c_long]
-#[cfg_attr(target_pointer_width = "32", repr(C, align(4)))]
-#[cfg_attr(target_pointer_width = "64", repr(C, align(8)))]
-struct Cmsg<const N: usize> {
+pub(crate) struct Cmsg<const N: usize> {
+    _align: [libc::c_ulong; 0],
     hdr: libc::cmsghdr,
     data: [u8; N],
 }
 
 impl<const N: usize> Cmsg<N> {
-    fn new(level: i32, typ: i32, data: [u8; N]) -> Self {
+    pub(crate) fn new(level: i32, typ: i32, data: [u8; N]) -> Self {
         Self {
             hdr: libc::cmsghdr {
                 // on Linux this is a usize, on macOS this is a u32
@@ -261,7 +260,20 @@ impl<const N: usize> Cmsg<N> {
                 cmsg_type: typ,
             },
             data,
+            _align: [],
         }
+    }
+
+    pub(crate) fn level(&self) -> i32 {
+        self.hdr.cmsg_level
+    }
+
+    pub(crate) fn typ(&self) -> i32 {
+        self.hdr.cmsg_type
+    }
+
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.data[..self.hdr.cmsg_len.min(N)]
     }
 }
 
@@ -291,4 +303,80 @@ pub fn send_close_notify(fd: RawFd) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// A wrapper around [`libc::sendmsg`].
+pub(crate) fn sendmsg<const N: usize>(
+    fd: RawFd,
+    data: &[io::IoSlice<'_>],
+    cmsg: Option<&Cmsg<N>>,
+    flags: i32,
+) -> io::Result<usize> {
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+
+    if let Some(cmsg) = cmsg {
+        msg.msg_control = cmsg as *const _ as *mut c_void;
+        msg.msg_controllen = std::mem::size_of_val(cmsg);
+    }
+
+    msg.msg_iov = data.as_ptr() as *const _ as *mut libc::iovec;
+    msg.msg_iovlen = data.len();
+
+    let ret = unsafe { libc::sendmsg(fd, &msg, flags) };
+    match ret {
+        -1 => Err(io::Error::last_os_error()),
+        len => Ok(len as usize),
+    }
+}
+
+/// Use [`libc::recvmsg`] to receive a whole message (with optional control
+/// message).
+///
+/// This will repeatedly call `recvmsg` until it reaches the end of the current
+/// record.
+pub(crate) fn recvmsg_whole<const N: usize>(
+    fd: RawFd,
+    data: &mut Vec<u8>,
+    mut cmsg: Option<&mut Cmsg<N>>,
+    flags: i32,
+) -> io::Result<i32> {
+    if data.capacity() < 16 {
+        data.reserve(16);
+    }
+
+    loop {
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        if let Some(cmsg) = cmsg.as_deref_mut() {
+            msg.msg_control = cmsg as *mut _ as *mut c_void;
+            msg.msg_controllen = std::mem::size_of_val(cmsg);
+        }
+
+        if data.spare_capacity_mut().is_empty() {
+            data.reserve(128);
+        }
+
+        let spare = data.spare_capacity_mut();
+        let mut iov = libc::iovec {
+            iov_base: spare.as_mut_ptr() as *mut c_void,
+            iov_len: spare.len(),
+        };
+
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+
+        // SAFETY: We have made sure to initialize msg with valid pointers (or NULL).
+        let ret = unsafe { libc::recvmsg(fd, &mut msg, flags) };
+        let count = match ret {
+            -1 => return Err(io::Error::last_os_error()),
+            len => len as usize,
+        };
+
+        // SAFETY: recvmsg has just written count to the bytes in the spare capacity of
+        //         the vector.
+        unsafe { data.set_len(data.len() + count) };
+
+        if msg.msg_flags & libc::MSG_EOR != 0 {
+            break Ok(msg.msg_flags);
+        }
+    }
 }
