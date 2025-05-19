@@ -1,15 +1,15 @@
+use std::io;
+use std::ops::{Deref, DerefMut};
+use std::os::fd::AsRawFd;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use rustls::kernel::KernelConnection;
 use rustls::{
     AlertDescription, ConnectionTrafficSecrets, ContentType, HandshakeType, InvalidMessage,
     PeerMisbehaved, ProtocolVersion, SupportedCipherSuite,
 };
-use std::io;
-use std::ops::{Deref, DerefMut};
-use std::os::unix::io::AsRawFd;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-
-use rustls::kernel::KernelConnection;
 
 use crate::ffi::{setup_tls_info, Cmsg, Direction};
 use crate::protocol::{AlertLevel, KeyUpdateRequest};
@@ -18,219 +18,142 @@ use crate::CryptoInfo;
 type KernelClientConnection = KernelConnection<rustls::client::ClientConnectionData>;
 type KernelServerConnection = KernelConnection<rustls::server::ServerConnectionData>;
 
-struct ConnectionData<Conn: ?Sized> {
-    rx_messages_since_last_key_update: u64,
-    tx_messages_since_last_key_update: u64,
-
-    awaiting_key_update: bool,
-
-    confidentiality_limit: u64,
-
-    conn: Conn,
-}
-
-type ClientConnectionData = ConnectionData<KernelClientConnection>;
-type ServerConnectionData = ConnectionData<KernelServerConnection>;
-
-enum Side<Client, Server> {
-    Client(Client),
-    Server(Server),
-}
-
-enum BufferedData {
-    EarlyData(OffsetVec),
-    Scratch(Vec<u8>),
-}
-
-#[derive(Default)]
-struct KTlsStreamState {
-    write_closed: bool,
-    read_closed: bool,
-}
-
-trait KTlsConnection: Send + Sync + 'static {
-    fn as_side(&self) -> Side<&KernelClientConnection, &KernelServerConnection>;
-    fn as_side_mut(&mut self) -> Side<&mut KernelClientConnection, &mut KernelServerConnection>;
-
-    fn protocol_version(&self) -> ProtocolVersion {
-        match self.as_side() {
-            Side::Client(client) => client.protocol_version(),
-            Side::Server(server) => server.protocol_version(),
-        }
-    }
-
-    fn update_rx_secret(&mut self) -> Result<(u64, ConnectionTrafficSecrets), rustls::Error> {
-        match self.as_side_mut() {
-            Side::Client(client) => client.update_rx_secret(),
-            Side::Server(server) => server.update_rx_secret(),
-        }
-    }
-
-    fn update_tx_secret(&mut self) -> Result<(u64, ConnectionTrafficSecrets), rustls::Error> {
-        match self.as_side_mut() {
-            Side::Client(client) => client.update_tx_secret(),
-            Side::Server(server) => server.update_tx_secret(),
-        }
-    }
-
-    fn negotiated_cipher_suite(&self) -> SupportedCipherSuite {
-        match self.as_side() {
-            Side::Client(client) => client.negotiated_cipher_suite(),
-            Side::Server(server) => server.negotiated_cipher_suite(),
-        }
-    }
-}
-
-impl KTlsConnection for KernelClientConnection {
-    fn as_side(&self) -> Side<&KernelClientConnection, &KernelServerConnection> {
-        Side::Client(self)
-    }
-
-    fn as_side_mut(&mut self) -> Side<&mut KernelClientConnection, &mut KernelServerConnection> {
-        Side::Client(self)
-    }
-}
-
-impl KTlsConnection for KernelServerConnection {
-    fn as_side(&self) -> Side<&KernelClientConnection, &KernelServerConnection> {
-        Side::Server(self)
-    }
-
-    fn as_side_mut(&mut self) -> Side<&mut KernelClientConnection, &mut KernelServerConnection> {
-        Side::Server(self)
-    }
-}
-
 pin_project_lite::pin_project! {
     #[project = KTlsStreamProject]
-    pub(crate) struct KTlsStreamInner<IO, Conn: ?Sized> {
+    pub(crate) struct KTlsStreamImpl<IO, Conn: ?Sized> {
         #[pin]
         socket: IO,
-        data: BufferedData,
-        state: KTlsStreamState,
-
-        // KernelConnection is quite large so we box it here to avoid excessively
-        // increasing the size of `KTlsStream`.
-        conn: Box<ConnectionData<Conn>>,
+        state: StreamState,
+        data: StreamData<Conn>,
     }
 }
 
-/// Everything in [`KTlsStreamProject`] except `data`.
-///
-/// Due to the way we reuse the buffer in `data` we frequently need to be able
-/// to borrow "everything except `data`" when implementing handling for control
-/// messages.
-struct KTlsStreamCoreProject<'a, IO, Conn: ?Sized> {
-    socket: Pin<&'a mut IO>,
-    state: &'a mut KTlsStreamState,
-    conn: &'a mut Box<ConnectionData<Conn>>,
-}
-
-impl<IO> KTlsStreamInner<IO, KernelClientConnection> {
-    /// Create a new client stream from a socket and [`KernelConnection`].
-    ///
-    /// This assumes that `socket` has already been initialized as a kTLS
-    /// socket.
-    pub(crate) fn new_client(socket: IO, conn: KernelClientConnection) -> Self {
-        Self::new_inner(socket, Vec::new(), conn)
-    }
-}
-
-impl<IO> KTlsStreamInner<IO, KernelServerConnection> {
-    /// Create a new client stream from a socket and [`KernelConnection`].
-    ///
-    /// This assumes that `socket` has already been initialized as a kTLS
-    /// socket. If early data was recieved in the handshake, then it should be
-    /// passed in `early`, otherwise it should be empty.
-    pub(crate) fn new_server(socket: IO, early: Vec<u8>, conn: KernelServerConnection) -> Self {
-        Self::new_inner(socket, early, conn)
-    }
-}
-
-impl<IO, Data> KTlsStreamInner<IO, KernelConnection<Data>> {
-    fn new_inner(socket: IO, early: Vec<u8>, conn: KernelConnection<Data>) -> Self {
-        let suite_common = match conn.negotiated_cipher_suite() {
-            #[cfg(feature = "tls12")]
-            rustls::SupportedCipherSuite::Tls12(suite) => &suite.common,
-            rustls::SupportedCipherSuite::Tls13(suite) => &suite.common,
-            _ => panic!("rustls has feature tls12 enabled but ktls does not"),
-        };
-
-        let data = if early.is_empty() {
-            BufferedData::Scratch(early)
-        } else {
-            BufferedData::EarlyData(OffsetVec::new(early))
-        };
-
-        Self {
-            socket,
-            data,
-            state: KTlsStreamState::default(),
-            conn: Box::new(ConnectionData {
-                // Use 16 as a safety margin to deal with messages that have
-                // been sent after the handshake has been established.
-                rx_messages_since_last_key_update: 16,
-                tx_messages_since_last_key_update: 16,
-                awaiting_key_update: false,
-                confidentiality_limit: suite_common.confidentiality_limit,
-
-                conn,
-            }),
-        }
-    }
-}
-
-impl<IO, Conn: ?Sized> KTlsStreamInner<IO, Conn> {
-    fn read_early_data(buffer: &mut BufferedData, buf: &mut ReadBuf<'_>) -> usize {
-        let cursor = match buffer {
-            BufferedData::EarlyData(cursor) => cursor,
-            _ => return 0,
-        };
-
-        let count = cursor.read_buf(buf);
-        if cursor.is_empty() {
-            let mut scratch = std::mem::take(cursor).into_cleared_vec();
-            scratch.shrink_to(DEFAULT_SCRATCH_CAPACITY);
-
-            *buffer = BufferedData::Scratch(scratch);
-        }
-
-        count
-    }
-}
-
-impl<IO, Conn: ?Sized> KTlsStreamInner<IO, Conn>
+impl<IO, Conn> KTlsStreamProject<'_, IO, Conn>
 where
     IO: AsyncRead + AsyncWrite + AsRawFd,
-    Conn: KTlsConnection,
+    Conn: ?Sized,
+    StreamData<Conn>: StreamSide,
 {
-    pub(crate) fn handle_control_message(self: Pin<&mut Self>) -> io::Result<()> {
-        let mut this = self.project();
-        let (mut core, data) = this.as_core_parts();
-        core.handle_control_message(data)
-    }
-}
+    fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        if self.state.early_data() {
+            if self.poll_read_early_data(buf) != 0 {
+                return Poll::Ready(Ok(()));
+            }
+        }
 
-impl<IO, Conn: ?Sized> KTlsStreamProject<'_, IO, Conn> {
-    fn as_core_parts<'a>(
-        &'a mut self,
-    ) -> (KTlsStreamCoreProject<'a, IO, Conn>, &'a mut BufferedData) {
-        (
-            KTlsStreamCoreProject {
-                socket: self.socket.as_mut(),
-                state: self.state,
-                conn: self.conn,
-            },
-            self.data,
-        )
-    }
-}
+        for _ in 0..4 {
+            if self.state.read_closed() {
+                return Poll::Ready(Ok(()));
+            }
 
-impl<IO, Conn: ?Sized> KTlsStreamCoreProject<'_, IO, Conn>
-where
-    IO: AsyncRead + AsyncWrite + AsRawFd,
-    Conn: KTlsConnection,
-{
+            match self.socket.as_mut().poll_read(cx, buf) {
+                // Linux returns EIO when there is a control message to be read
+                // but there is no CMsg space to write to.
+                //
+                // If we get this as an error it means there is a control message
+                // that we need to handle.
+                Poll::Ready(Err(e)) if e.raw_os_error() == Some(libc::EIO) => (),
+                poll => return poll,
+            }
+
+            self.handle_control_message()?;
+        }
+
+        // We've already handled multiple control messages with this poll, yield
+        // for now but arrange to be woken up right away.
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+
+    fn poll_read_early_data(&mut self, buf: &mut ReadBuf<'_>) -> usize {
+        let data = &self.data.buffer[self.data.offset..];
+
+        let available = buf.remaining();
+        let data = &data[..available.min(data.len())];
+        buf.put_slice(data);
+
+        let len = data.len();
+        self.data.offset += data.len();
+        if self.data.offset == self.data.buffer.len() {
+            self.data.buffer.clear();
+            self.data.offset = 0;
+            self.state.0 &= !StreamState::EARLY_DATA;
+
+            self.data.buffer.shrink_to(MAX_SCRATCH_CAPACITY);
+        }
+
+        len
+    }
+
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        if self.state.contains(StreamState::PENDING_CLOSE) {
+            std::task::ready!(self.poll_do_close(cx))?;
+        }
+
+        if self.state.write_closed() {
+            return Poll::Ready(Ok(0));
+        }
+
+        self.socket.as_mut().poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        if self.state.contains(StreamState::PENDING_CLOSE) {
+            std::task::ready!(self.poll_do_close(cx))?;
+        }
+
+        if self.state.write_closed() {
+            return Poll::Ready(Ok(0));
+        }
+
+        self.socket.as_mut().poll_write_vectored(cx, bufs)
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.state.contains(StreamState::PENDING_CLOSE) {
+            std::task::ready!(self.poll_do_close(cx))?;
+        }
+
+        if self.state.write_closed() {
+            return Poll::Ready(Ok(()));
+        }
+
+        self.socket.as_mut().poll_flush(cx)
+    }
+
+    fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.state.contains(StreamState::PENDING_CLOSE) {
+            std::task::ready!(self.poll_do_close(cx))?;
+        }
+
+        self.state.0 |= StreamState::WRITE_CLOSED;
+        self.socket.as_mut().poll_shutdown(cx)
+    }
+
+    fn poll_do_close(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.socket.as_mut().poll_flush(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => {
+                self.state.0 &= !StreamState::PENDING_CLOSE;
+
+                if result.is_ok() {
+                    if let Err(e) =
+                        self.send_alert(AlertLevel::Warning, AlertDescription::CloseNotify)
+                    {
+                        return Poll::Ready(Err(e));
+                    }
+                }
+
+                self.state.0 |= StreamState::WRITE_CLOSED;
+                Poll::Ready(result)
+            }
+        }
+    }
+
     fn key_update(&mut self, request: KeyUpdateRequest) -> io::Result<()> {
         #[rustfmt::skip]
         let message = [
@@ -241,25 +164,18 @@ where
 
         self.send_cmsg(ContentType::Handshake, &[io::IoSlice::new(&message)])?;
 
-        if request == KeyUpdateRequest::UpdateRequested {
-            self.conn.awaiting_key_update = true;
-        }
-
-        self.conn.tx_messages_since_last_key_update = 1;
-
-        let (seq, secrets) = match self.conn.update_tx_secret() {
+        let (seq, secrets) = match self.data.update_tx_secret() {
             Ok(secrets) => secrets,
             Err(e) => {
-                return Err(self.abort_with_alert(
+                return Err(self.abort_with_error(
                     AlertDescription::InternalError,
-                    KTlsError::KeyUpdateFailed(e),
+                    KTlsStreamError::KeyUpdateFailed(e),
                 ));
             }
         };
 
         let crypto =
-            match CryptoInfo::from_rustls(self.conn.conn.negotiated_cipher_suite(), (seq, secrets))
-            {
+            match CryptoInfo::from_rustls(self.data.negotiated_cipher_suite(), (seq, secrets)) {
                 Ok(crypto) => crypto,
                 Err(e) => {
                     let _ = self.abort(AlertDescription::InternalError);
@@ -282,79 +198,28 @@ where
         Ok(())
     }
 
-    fn handle_read_complete(&mut self, bytes: usize) -> io::Result<()> {
-        let count = written.div_ceil(TLS_MAX_MESSAGE_LEN);
-        self.conn.rx_messages_since_last_key_update += count;
+    fn handle_control_message(&mut self) -> io::Result<()> {
+        let mut take = TakeBuffer::new(self);
+        let (this, data) = take.as_parts_mut();
 
-        if self.conn.confidentiality_limit == u64::MAX {
-            return Ok(());
-        }
-
-        let hard_limit = self.conn.confidentiality_limit - self.conn.confidentiality_limit / 32;
-        let soft_limit = self.conn.confidentiality_limit / 2;
-
-        if self.conn.rx_messages_since_last_key_update > hard_limit {
-            let _ = self.abort(AlertDescription::InternalError);
-            return Err(io::Error::other(
-                KTlsStreamError::ConfidentialityLimitReached,
-            ));
-        }
-
-        if !self.conn.awaiting_key_update
-            && self.conn.rx_messages_since_last_key_update > soft_limit
-        {
-            // We actually need the peer to update their keys
-            self.key_update(KeyUpdateRequest::UpdateRequested)?;
-        }
-
-        Ok(())
+        this.handle_control_message_impl(data)
     }
 
-    fn handle_write_complete(&mut self, bytes: usize) -> io::Result<()> {
-        let count = written.div_ceil(TLS_MAX_MESSAGE_LEN);
-        self.conn.tx_messages_since_last_key_update += count;
-
-        if self.conn.confidentiality_limit == u64::MAX {
-            return Ok(());
+    fn handle_control_message_impl(&mut self, buffer: &mut Vec<u8>) -> io::Result<()> {
+        if self.state.read_closed() {
+            return Err(io::Error::other(KTlsStreamError::Closed))
         }
 
-        let hard_limit = self.conn.confidentiality_limit - self.conn.confidentiality_limit / 32;
-        let soft_limit = self.conn.confidentiality_limit / 2;
-
-        if self.conn.tx_messages_since_last_key_update > hard_limit {
-            let _ = self.abort(AlertDescription::InternalError);
-            return Err(io::Error::other(
-                KTlsStreamError::ConfidentialityLimitReached,
-            ));
+        // We reuse the early data buffer to read the control message so it is
+        // an error to attempt to do so without having handled all the early
+        // data beforehand.
+        if self.state.early_data() {
+            return Err(io::Error::other(KTlsStreamError::ControlMessageWithBufferedData));
         }
 
-        if self.conn.rx_messages_since_last_key_update > soft_limit {
-            let request = if self.conn.rx_messages_since_last_key_update > soft_limit / 2 {
-                KeyUpdateRequest::UpdateRequested
-            } else {
-                KeyUpdateRequest::UpdateNotRequested
-            };
-
-            self.key_update(request)?;
-        }
-
-        Ok(())
-    }
-
-    fn handle_control_message(&mut self, buffered_data: &mut BufferedData) -> io::Result<()> {
-        if self.state.read_closed {
-            return Err(io::Error::other(KTlsStreamError::ConnectionShutDown));
-        }
-
-        let mut data = match buffered_data {
-            BufferedData::EarlyData(_) => {
-                panic!("all buffered application data must be handled before processing control messages")
-            }
-            BufferedData::Scratch(data) => ClearOnDrop(data),
-        };
+        let mut data = ClearOnDrop(buffer);
 
         let mut cmsg = Cmsg::new(0, 0, [0]);
-
         let flags = match crate::ffi::recvmsg_whole(
             self.socket.as_raw_fd(),
             &mut data,
@@ -395,9 +260,9 @@ where
                 //
                 // It's not ideal, but we can handle it.
 
-                let buffer = std::mem::take(&mut *data);
-                drop(data);
-                *buffered_data = BufferedData::EarlyData(OffsetVec::new(buffer));
+                std::mem::forget(data);
+                self.state.0 |= StreamState::EARLY_DATA;
+
                 return Ok(());
             }
 
@@ -452,20 +317,18 @@ where
             // The peer has closed their end of the connection. We close the read half
             // of the connection since we will receive no more data frames.
             AlertDescription::CloseNotify => {
-                self.state.read_closed = true;
+                self.state.0 |= StreamState::READ_CLOSED;
             }
 
             // TLS 1.2 allows alerts to be sent with a warning level without terminating
             // the connection. In this case we ignore the alert.
-            _ if self.conn.conn.protocol_version() == ProtocolVersion::TLSv1_2
+            _ if self.data.protocol_version() == ProtocolVersion::TLSv1_2
                 && level == AlertLevel::Warning => {}
 
             // All other alerts are treated as fatal and result in us immediately shutting
             // down the connection and emitting an error.
             _ => {
-                self.state.read_closed = true;
-                self.state.write_closed = true;
-
+                self.state.0 = StreamState::CLOSED;
                 return Err(io::Error::other(KTlsStreamError::Alert(desc)));
             }
         }
@@ -503,17 +366,17 @@ where
 
             // KeyUpdate messages must be the only sub-message within their message.
             if ty == HandshakeType::KeyUpdate
-                && self.conn.protocol_version() == ProtocolVersion::TLSv1_3
+                && self.data.protocol_version() == ProtocolVersion::TLSv1_3
             {
                 if !first || !data.is_empty() {
-                    return Err(self.abort_with_alert(
+                    return Err(self.abort_with_error(
                         AlertDescription::UnexpectedMessage,
                         PeerMisbehaved::KeyEpochWithPendingFragment,
                     ));
                 }
             }
 
-            self.handle_single_handshake(typ, msg)?;
+            self.handle_single_handshake(ty, msg)?;
             first = false;
         }
 
@@ -523,7 +386,7 @@ where
     fn handle_single_handshake(&mut self, typ: HandshakeType, data: &[u8]) -> io::Result<()> {
         match typ {
             HandshakeType::KeyUpdate
-                if self.conn.conn.protocol_version() == ProtocolVersion::TLSv1_3 =>
+                if self.data.protocol_version() == ProtocolVersion::TLSv1_3 =>
             {
                 let req = match data {
                     &[req] => KeyUpdateRequest::from(req),
@@ -535,7 +398,7 @@ where
                     }
                 };
 
-                let (seq, secrets) = match self.conn.conn.update_rx_secret() {
+                let (seq, secrets) = match self.data.update_rx_secret() {
                     Ok(secrets) => secrets,
                     Err(e) => {
                         return Err(self.abort_with_error(
@@ -546,7 +409,7 @@ where
                 };
 
                 let crypto = match CryptoInfo::from_rustls(
-                    self.conn.conn.negotiated_cipher_suite(),
+                    self.data.negotiated_cipher_suite(),
                     (seq, secrets),
                 ) {
                     Ok(crypto) => crypto,
@@ -582,10 +445,10 @@ where
             }
 
             HandshakeType::NewSessionTicket
-                if self.conn.conn.protocol_version() == ProtocolVersion::TLSv1_3 =>
+                if self.data.protocol_version() == ProtocolVersion::TLSv1_3 =>
             {
-                match self.conn.conn.as_side() {
-                    Side::Client(conn) => match conn.handle_new_session_ticket(data) {
+                match self.data.as_side_mut() {
+                    Side::Client(conn) => match conn.conn.handle_new_session_ticket(data) {
                         Ok(()) => (),
                         // Convert some messages into their higher-level equivalents
                         Err(rustls::Error::InvalidMessage(err)) => {
@@ -598,7 +461,9 @@ where
                         }
 
                         // Other errors are not necessarily fatal
-                        Err(e) => return Err(KTlsStreamError::SessionTicketFailed(e)),
+                        Err(e) => {
+                            return Err(io::Error::other(KTlsStreamError::SessionTicketFailed(e)))
+                        }
                     },
                     Side::Server(_) => {
                         return Err(self.abort_with_error(
@@ -612,7 +477,7 @@ where
             }
 
             _ => {
-                return match self.conn.conn.protocol_version() {
+                return Err(match self.data.protocol_version() {
                     ProtocolVersion::TLSv1_3 => self.abort_with_error(
                         AlertDescription::UnexpectedMessage,
                         InvalidMessage::UnexpectedMessage(
@@ -625,7 +490,7 @@ where
                             "handshake messages are not expected on TLS 1.2 connections",
                         ),
                     ),
-                }
+                })
             }
         }
 
@@ -633,10 +498,8 @@ where
     }
 
     fn abort(&mut self, alert: AlertDescription) -> io::Result<()> {
-        let write_closed = self.state.write_closed;
-
-        self.state.read_closed = true;
-        self.state.write_closed = true;
+        let write_closed = self.state.write_closed();
+        self.state.0 = StreamState::WRITE_CLOSED | StreamState::READ_CLOSED;
 
         if !write_closed {
             self.send_alert(AlertLevel::Fatal, alert)?;
@@ -663,15 +526,7 @@ where
         self.send_cmsg(ContentType::Alert, &iov)
     }
 
-    fn shutdown(&self) -> io::Result<()> {
-        self.state.write_closed = true;
-        self.send_alert(AlertLevel::Warning, AlertDescription::CloseNotify)?;
-        Ok(())
-    }
-
     fn send_cmsg(&self, typ: ContentType, data: &[io::IoSlice<'_>]) -> io::Result<()> {
-        self.conn.tx_messages_since_last_key_update += 1;
-
         let cmsg = Cmsg::new(libc::SOL_TLS, libc::TLS_SET_RECORD_TYPE, [typ.into()]);
         // TODO: Should an error here abort the whole connection?
         crate::ffi::sendmsg(self.socket.as_raw_fd(), data, Some(&cmsg), 0)?;
@@ -679,117 +534,49 @@ where
     }
 }
 
-impl<IO, Conn: ?Sized> AsyncRead for KTlsStreamInner<IO, Conn>
+impl<IO, Conn> AsyncRead for KTlsStreamImpl<IO, Conn>
 where
     IO: AsyncRead + AsyncWrite + AsRawFd,
-    Conn: KTlsConnection,
+    Conn: ?Sized,
+    StreamData<Conn>: StreamSide,
 {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let mut this = self.project();
-
-        if matches!(this.data, BufferedData::EarlyData(_)) {
-            match Self::read_early_data(this.data, buf) {
-                0 => (),
-                _ => return Poll::Ready(Ok(())),
-            }
-        }
-
-        // We want to gracefully handle control messages, but we don't want to
-        // hold up the task if there are lots of them.
-        for _ in 0..4 {
-            if this.state.read_closed {
-                return Poll::Ready(Ok(()));
-            }
-
-            let start = buf.filled().len();
-            match this.socket.as_mut().poll_read(cx, buf) {
-                // Linux returns EIO when there is a control message to be read
-                // but there is no CMsg space to write to.
-                //
-                // If we get this as an error it means there is a control message
-                // that we need to handle.
-                Poll::Ready(Err(e)) if e.raw_os_error() == Some(libc::EIO) => (),
-                poll @ Poll::Ready(Ok(())) => {
-                    let end = buf.filled().len();
-                    let written = end.checked_sub(start).unwrap_or(buf.capacity());
-
-                    this.as_core_parts().0.handle_read_complete(written)?;
-                }
-                poll => return poll,
-            }
-
-            let (mut core, data) = this.as_core_parts();
-            core.handle_control_message(data)?;
-        }
-
-        cx.waker().wake_by_ref();
-        Poll::Pending
+        self.project().poll_read(cx, buf)
     }
 }
 
-impl<IO, Conn: ?Sized> AsyncWrite for KTlsStreamInner<IO, Conn>
+impl<IO, Conn> AsyncWrite for KTlsStreamImpl<IO, Conn>
 where
     IO: AsyncRead + AsyncWrite + AsRawFd,
-    Conn: KTlsConnection,
+    Conn: ?Sized,
+    StreamData<Conn>: StreamSide,
 {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let mut this = self.project();
-
-        if this.state.write_closed {
-            return Poll::Ready(Ok(0));
-        }
-
-        match this.socket.poll_write(cx, buf) {
-            poll @ Poll::Ready(Ok(bytes)) => {
-                this.as_core_parts().0.handle_write_complete(bytes)?;
-            }
-            poll => poll,
-        }
+    ) -> Poll<Result<usize, io::Error>> {
+        self.project().poll_write(cx, buf)
     }
 
     fn poll_write_vectored(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        let mut this = self.project();
-
-        if this.state.write_closed {
-            return Poll::Ready(Ok(0));
-        }
-
-        match this.socket.poll_write_vectored(cx, buf) {
-            poll @ Poll::Ready(Ok(bytes)) => {
-                this.as_core_parts().0.handle_write_complete(bytes)?;
-            }
-            poll => poll,
-        }
+    ) -> Poll<Result<usize, io::Error>> {
+        self.project().poll_write_vectored(cx, bufs)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut this = self.project();
-
-        this.socket.poll_flush(cx)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        self.project().poll_flush(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut this = self.project();
-
-        if !this.state.write_closed {
-            if let Err(e) = this.as_core_parts().0.shutdown() {
-                return Poll::Ready(Err(e));
-            }
-        }
-
-        this.socket.poll_shutdown(cx)
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        self.project().poll_shutdown(cx)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -797,33 +584,160 @@ where
     }
 }
 
-#[derive(Default)]
-struct OffsetVec {
-    data: Vec<u8>,
+pub(crate) struct StreamData<Conn: ?Sized> {
+    /// This buffer is used to store early data and also as a buffer to store
+    /// received control messages.
+    buffer: Vec<u8>,
     offset: usize,
+
+    conn: Conn,
 }
 
-impl OffsetVec {
-    pub fn new(data: Vec<u8>) -> Self {
-        Self { data, offset: 0 }
+impl<Conn> StreamData<Conn>
+where
+    Self: StreamSide,
+    Conn: ?Sized,
+{
+    fn protocol_version(&self) -> ProtocolVersion {
+        match self.as_side() {
+            Side::Client(client) => client.conn.protocol_version(),
+            Side::Server(server) => server.conn.protocol_version(),
+        }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.offset == self.data.len()
+    fn negotiated_cipher_suite(&self) -> SupportedCipherSuite {
+        match self.as_side() {
+            Side::Client(client) => client.conn.negotiated_cipher_suite(),
+            Side::Server(server) => server.conn.negotiated_cipher_suite(),
+        }
     }
 
-    pub fn into_cleared_vec(mut self) -> Vec<u8> {
-        self.data.clear();
-        self.data
+    fn update_tx_secret(&mut self) -> Result<(u64, ConnectionTrafficSecrets), rustls::Error> {
+        match self.as_side_mut() {
+            Side::Client(client) => client.conn.update_tx_secret(),
+            Side::Server(server) => server.conn.update_tx_secret(),
+        }
     }
 
-    pub fn read_buf(&mut self, buf: &mut ReadBuf<'_>) -> usize {
-        let tail = &self.data[self.offset..];
-        let removed = &tail[..tail.len().min(buf.remaining())];
-        buf.put_slice(removed);
-        self.offset += removed.len();
-        removed.len()
+    fn update_rx_secret(&mut self) -> Result<(u64, ConnectionTrafficSecrets), rustls::Error> {
+        match self.as_side_mut() {
+            Side::Client(client) => client.conn.update_rx_secret(),
+            Side::Server(server) => server.conn.update_rx_secret(),
+        }
     }
+}
+
+pub(crate) trait StreamSide: 'static {
+    fn as_side(
+        &self,
+    ) -> Side<&StreamData<KernelClientConnection>, &StreamData<KernelServerConnection>>;
+
+    fn as_side_mut(
+        &mut self,
+    ) -> Side<&mut StreamData<KernelClientConnection>, &mut StreamData<KernelServerConnection>>;
+}
+
+impl StreamSide for StreamData<KernelClientConnection> {
+    fn as_side(
+        &self,
+    ) -> Side<&StreamData<KernelClientConnection>, &StreamData<KernelServerConnection>> {
+        Side::Client(self)
+    }
+
+    fn as_side_mut(
+        &mut self,
+    ) -> Side<&mut StreamData<KernelClientConnection>, &mut StreamData<KernelServerConnection>>
+    {
+        Side::Client(self)
+    }
+}
+
+impl StreamSide for StreamData<KernelServerConnection> {
+    fn as_side(
+        &self,
+    ) -> Side<&StreamData<KernelClientConnection>, &StreamData<KernelServerConnection>> {
+        Side::Server(self)
+    }
+
+    fn as_side_mut(
+        &mut self,
+    ) -> Side<&mut StreamData<KernelClientConnection>, &mut StreamData<KernelServerConnection>>
+    {
+        Side::Server(self)
+    }
+}
+
+#[derive(Copy, Clone, Default, Debug, Eq, PartialEq, Hash)]
+struct StreamState(u8);
+
+#[rustfmt::skip]
+impl StreamState {
+    const READ_CLOSED:   u8 = 0b00001;
+    const WRITE_CLOSED:  u8 = 0b00010;
+    const CLOSED:        u8 = 0b00011;
+    const EARLY_DATA:    u8 = 0b00100;
+    const PENDING_CLOSE: u8 = 0b01000;
+}
+
+impl StreamState {
+    fn contains(self, flags: u8) -> bool {
+        self.0 & flags == flags
+    }
+
+    fn read_closed(self) -> bool {
+        self.contains(Self::READ_CLOSED)
+    }
+
+    fn write_closed(self) -> bool {
+        self.contains(Self::WRITE_CLOSED)
+    }
+
+    fn early_data(self) -> bool {
+        self.contains(Self::EARLY_DATA)
+    }
+}
+
+const MAX_SCRATCH_CAPACITY: usize = 1024;
+
+#[derive(Debug, thiserror::Error)]
+pub enum KTlsStreamError {
+    #[error("received corrupt message of type {0:?}")]
+    InvalidMessage(InvalidMessage),
+
+    #[error("peer misbehaved: {0:?}")]
+    PeerMisbehaved(PeerMisbehaved),
+
+    #[error("{0}")]
+    KeyUpdateFailed(#[source] rustls::Error),
+
+    #[error("failed to handle a provided session ticket: {0}")]
+    SessionTicketFailed(#[source] rustls::Error),
+
+    #[error("the connection has been closed by the peer")]
+    Closed,
+
+    #[error("cannot handle control messages while there is buffered data to read")]
+    ControlMessageWithBufferedData,
+
+    #[error("connection peer closed the connection with an alert: {0:?}")]
+    Alert(AlertDescription),
+}
+
+impl From<InvalidMessage> for KTlsStreamError {
+    fn from(error: InvalidMessage) -> Self {
+        Self::InvalidMessage(error)
+    }
+}
+
+impl From<PeerMisbehaved> for KTlsStreamError {
+    fn from(error: PeerMisbehaved) -> Self {
+        Self::PeerMisbehaved(error)
+    }
+}
+
+pub(crate) enum Side<Client, Server> {
+    Client(Client),
+    Server(Server),
 }
 
 struct ClearOnDrop<'a>(&'a mut Vec<u8>);
@@ -848,41 +762,26 @@ impl Drop for ClearOnDrop<'_> {
     }
 }
 
-const DEFAULT_SCRATCH_CAPACITY: usize = 256;
-const TLS_MAX_MESSAGE_LEN: usize = 1 << 14;
-
-#[derive(Debug, thiserror::Error)]
-enum KTlsStreamError {
-    #[error("received corrupt message of type {0:?}")]
-    InvalidMessage(InvalidMessage),
-
-    #[error("peer misbehaved: {0:?}")]
-    PeerMisbehaved(PeerMisbehaved),
-
-    #[error("{0}")]
-    KeyUpdateFailed(#[source] rustls::Error),
-
-    #[error("failed to handle a provided session ticket: {0}")]
-    SessionTicketFailed(#[source] rustls::Error),
-
-    #[error("the connection has been shut down")]
-    ConnectionShutDown,
-
-    #[error("the connection has reached its confidentiality limit and has been shut down")]
-    ConfidentialityLimitReached,
-
-    #[error("connection peer closed the connection with an alert: {0:?}")]
-    Alert(AlertDescription),
+struct TakeBuffer<'a, 'b, IO, Conn: ?Sized> {
+    stream: &'a mut KTlsStreamProject<'b, IO, Conn>,
+    buffer: Vec<u8>,
 }
 
-impl From<InvalidMessage> for KTlsStreamError {
-    fn from(error: InvalidMessage) -> Self {
-        Self::InvalidMessage(error)
+impl<'a, 'b, IO, Conn: ?Sized> TakeBuffer<'a, 'b, IO, Conn> {
+    pub fn new(stream: &'a mut KTlsStreamProject<'b, IO, Conn>) -> Self {
+        Self {
+            buffer: std::mem::take(&mut stream.data.buffer),
+            stream,
+        }
+    }
+
+    pub fn as_parts_mut(&mut self) -> (&mut KTlsStreamProject<'b, IO, Conn>, &mut Vec<u8>) {
+        (&mut *self.stream, &mut self.buffer)
     }
 }
 
-impl From<PeerMisbehaved> for KTlsStreamError {
-    fn from(error: PeerMisbehaved) -> Self {
-        Self::PeerMisbehaved(error)
+impl<'a, 'b, IO, Conn: ?Sized> Drop for TakeBuffer<'a, 'b, IO, Conn> {
+    fn drop(&mut self) {
+        self.stream.data.buffer = std::mem::take(&mut self.buffer);
     }
 }

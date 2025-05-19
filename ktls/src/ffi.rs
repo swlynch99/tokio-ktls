@@ -229,12 +229,10 @@ impl CryptoInfo {
     }
 }
 
-pub fn setup_tls_info(fd: RawFd, dir: Direction, info: CryptoInfo) -> Result<(), crate::Error> {
+pub fn setup_tls_info(fd: RawFd, dir: Direction, info: CryptoInfo) -> io::Result<()> {
     let ret = unsafe { libc::setsockopt(fd, SOL_TLS, dir.into(), info.as_ptr(), info.size() as _) };
     if ret < 0 {
-        return Err(crate::Error::TlsCryptoInfoError(
-            std::io::Error::last_os_error(),
-        ));
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }

@@ -36,9 +36,8 @@ pub use ktls_stream::KtlsStream;
 mod cork_stream;
 pub use cork_stream::CorkStream;
 
-mod client;
-mod stream;
 mod protocol;
+mod stream;
 
 #[derive(Debug, Default)]
 pub struct CompatibleCiphers {
@@ -216,7 +215,7 @@ fn sample_cipher_setup(sock: &TcpStream, cipher_suite: SupportedCipherSuite) -> 
 
     setup_ulp(fd).map_err(Error::UlpError)?;
 
-    setup_tls_info(fd, ffi::Direction::Tx, crypto_info)?;
+    setup_tls_info(fd, ffi::Direction::Tx, crypto_info).map_err(Error::TlsCryptoInfoError)?;
 
     Ok(())
 }
@@ -340,10 +339,10 @@ fn setup_inner(fd: RawFd, conn: Connection) -> Result<(), Error> {
     ffi::setup_ulp(fd).map_err(Error::UlpError)?;
 
     let tx = CryptoInfo::from_rustls(cipher_suite, secrets.tx)?;
-    setup_tls_info(fd, ffi::Direction::Tx, tx)?;
+    setup_tls_info(fd, ffi::Direction::Tx, tx).map_err(Error::TlsCryptoInfoError)?;
 
     let rx = CryptoInfo::from_rustls(cipher_suite, secrets.rx)?;
-    setup_tls_info(fd, ffi::Direction::Rx, rx)?;
+    setup_tls_info(fd, ffi::Direction::Rx, rx).map_err(Error::TlsCryptoInfoError)?;
 
     Ok(())
 }
