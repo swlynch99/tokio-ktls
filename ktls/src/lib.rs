@@ -36,8 +36,12 @@ pub use ktls_stream::KtlsStream;
 mod cork_stream;
 pub use cork_stream::CorkStream;
 
+mod client;
 mod protocol;
 mod stream;
+
+pub use crate::stream::KTlsStreamError;
+pub use crate::client::KTlsClientStream;
 
 #[derive(Debug, Default)]
 pub struct CompatibleCiphers {
