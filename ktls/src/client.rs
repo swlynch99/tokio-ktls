@@ -13,6 +13,7 @@ use crate::CryptoInfo;
 use crate::{ConnectError, TryConnectError};
 
 pin_project_lite::pin_project! {
+    /// The client half of a kTLS stream.
     pub struct KTlsClientStream<IO> {
         #[pin]
         pub(crate) stream: KTlsStreamImpl<IO, KernelConnection<ClientConnectionData>>
