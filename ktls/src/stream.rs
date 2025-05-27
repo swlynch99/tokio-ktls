@@ -1,6 +1,6 @@
 use std::io;
 use std::ops::{Deref, DerefMut};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -19,12 +19,48 @@ type KernelClientConnection = KernelConnection<rustls::client::ClientConnectionD
 type KernelServerConnection = KernelConnection<rustls::server::ServerConnectionData>;
 
 pin_project_lite::pin_project! {
+    /// A generic kTLS stream.
+    ///
+    /// Most of the behaviour is identical between client and server streams so
+    /// this type allows either. In the cases where there is a difference, the
+    /// [`StreamSide`] trait is used to get the correct side of the stream.
     #[project = KTlsStreamProject]
     pub(crate) struct KTlsStreamImpl<IO, Conn: ?Sized> {
         #[pin]
         socket: IO,
         state: StreamState,
-        data: StreamData<Conn>,
+        data: Box<StreamData<Conn>>,
+    }
+}
+
+impl<IO, Conn> KTlsStreamImpl<IO, Conn>
+where
+    IO: AsyncRead + AsyncWrite + AsRawFd,
+    Conn: ?Sized,
+    StreamData<Conn>: StreamSide,
+{
+    pub(crate) fn new(socket: IO, early_data: Vec<u8>, conn: Conn) -> Self
+    where
+        Conn: Sized,
+    {
+        let (state, buffer) = match () {
+            _ if !early_data.is_empty() => (StreamState::EARLY_DATA, early_data),
+            _ if early_data.capacity() != 0 => (StreamState::default(), early_data),
+            _ => (
+                StreamState::default(),
+                Vec::with_capacity(DEFAULT_SCRATCH_CAPACITY),
+            ),
+        };
+
+        Self {
+            socket,
+            state,
+            data: Box::new(StreamData {
+                buffer,
+                offset: 0,
+                conn,
+            }),
+        }
     }
 }
 
@@ -77,7 +113,7 @@ where
         if self.data.offset == self.data.buffer.len() {
             self.data.buffer.clear();
             self.data.offset = 0;
-            self.state.0 &= !StreamState::EARLY_DATA;
+            *self.state &= !StreamState::EARLY_DATA;
 
             self.data.buffer.shrink_to(MAX_SCRATCH_CAPACITY);
         }
@@ -130,7 +166,7 @@ where
             std::task::ready!(self.poll_do_close(cx))?;
         }
 
-        self.state.0 |= StreamState::WRITE_CLOSED;
+        *self.state |= StreamState::WRITE_CLOSED;
         self.socket.as_mut().poll_shutdown(cx)
     }
 
@@ -138,7 +174,7 @@ where
         match self.socket.as_mut().poll_flush(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(result) => {
-                self.state.0 &= !StreamState::PENDING_CLOSE;
+                *self.state &= !StreamState::PENDING_CLOSE;
 
                 if result.is_ok() {
                     if let Err(e) =
@@ -148,7 +184,7 @@ where
                     }
                 }
 
-                self.state.0 |= StreamState::WRITE_CLOSED;
+                *self.state |= StreamState::WRITE_CLOSED;
                 Poll::Ready(result)
             }
         }
@@ -207,14 +243,16 @@ where
 
     fn handle_control_message_impl(&mut self, buffer: &mut Vec<u8>) -> io::Result<()> {
         if self.state.read_closed() {
-            return Err(io::Error::other(KTlsStreamError::Closed))
+            return Err(io::Error::other(KTlsStreamError::Closed));
         }
 
         // We reuse the early data buffer to read the control message so it is
         // an error to attempt to do so without having handled all the early
         // data beforehand.
         if self.state.early_data() {
-            return Err(io::Error::other(KTlsStreamError::ControlMessageWithBufferedData));
+            return Err(io::Error::other(
+                KTlsStreamError::ControlMessageWithBufferedData,
+            ));
         }
 
         let mut data = ClearOnDrop(buffer);
@@ -261,7 +299,7 @@ where
                 // It's not ideal, but we can handle it.
 
                 std::mem::forget(data);
-                self.state.0 |= StreamState::EARLY_DATA;
+                *self.state |= StreamState::EARLY_DATA;
 
                 return Ok(());
             }
@@ -317,7 +355,7 @@ where
             // The peer has closed their end of the connection. We close the read half
             // of the connection since we will receive no more data frames.
             AlertDescription::CloseNotify => {
-                self.state.0 |= StreamState::READ_CLOSED;
+                *self.state |= StreamState::READ_CLOSED;
             }
 
             // TLS 1.2 allows alerts to be sent with a warning level without terminating
@@ -328,7 +366,7 @@ where
             // All other alerts are treated as fatal and result in us immediately shutting
             // down the connection and emitting an error.
             _ => {
-                self.state.0 = StreamState::CLOSED;
+                *self.state = StreamState::CLOSED;
                 return Err(io::Error::other(KTlsStreamError::Alert(desc)));
             }
         }
@@ -499,7 +537,7 @@ where
 
     fn abort(&mut self, alert: AlertDescription) -> io::Result<()> {
         let write_closed = self.state.write_closed();
-        self.state.0 = StreamState::WRITE_CLOSED | StreamState::READ_CLOSED;
+        *self.state = StreamState::WRITE_CLOSED | StreamState::READ_CLOSED;
 
         if !write_closed {
             self.send_alert(AlertLevel::Fatal, alert)?;
@@ -581,6 +619,15 @@ where
 
     fn is_write_vectored(&self) -> bool {
         self.socket.is_write_vectored()
+    }
+}
+
+impl<IO, Conn> AsRawFd for KTlsStreamImpl<IO, Conn>
+where
+    IO: AsRawFd,
+{
+    fn as_raw_fd(&self) -> RawFd {
+        self.socket.as_raw_fd()
     }
 }
 
@@ -667,23 +714,18 @@ impl StreamSide for StreamData<KernelServerConnection> {
     }
 }
 
-#[derive(Copy, Clone, Default, Debug, Eq, PartialEq, Hash)]
-struct StreamState(u8);
-
-#[rustfmt::skip]
-impl StreamState {
-    const READ_CLOSED:   u8 = 0b00001;
-    const WRITE_CLOSED:  u8 = 0b00010;
-    const CLOSED:        u8 = 0b00011;
-    const EARLY_DATA:    u8 = 0b00100;
-    const PENDING_CLOSE: u8 = 0b01000;
+bitflags::bitflags! {
+    #[derive(Copy, Clone, Default, Debug, Eq, PartialEq, Hash)]
+    struct StreamState : u8 {
+        const READ_CLOSED   = 0b00001;
+        const WRITE_CLOSED  = 0b00010;
+        const CLOSED        = 0b00011;
+        const EARLY_DATA    = 0b00100;
+        const PENDING_CLOSE = 0b01000;
+    }
 }
 
 impl StreamState {
-    fn contains(self, flags: u8) -> bool {
-        self.0 & flags == flags
-    }
-
     fn read_closed(self) -> bool {
         self.contains(Self::READ_CLOSED)
     }
@@ -697,6 +739,7 @@ impl StreamState {
     }
 }
 
+const DEFAULT_SCRATCH_CAPACITY: usize = 64;
 const MAX_SCRATCH_CAPACITY: usize = 1024;
 
 #[derive(Debug, thiserror::Error)]

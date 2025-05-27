@@ -99,7 +99,7 @@ where
     buf.reserve(header.len as usize);
     let new_len = buf.len() + header.len as usize;
     let mut rdbuf = ReadBuf::uninit(&mut buf.spare_capacity_mut()[..header.len as usize]);
-  
+
     loop {
         let remaining = rdbuf.remaining();
         if remaining == 0 {
@@ -108,7 +108,7 @@ where
 
         stream.read_buf(&mut rdbuf).await?;
         if rdbuf.remaining() == remaining {
-            return Err(io::Error::from(io::ErrorKind::UnexpectedEof))
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
         }
     }
 

@@ -3,30 +3,29 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use rustls::client::{ClientConnectionData, UnbufferedClientConnection};
 use rustls::kernel::KernelConnection;
+use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::ffi::Direction;
 use crate::stream::KTlsStreamImpl;
-use crate::CryptoInfo;
-use crate::{ConnectError, TryConnectError};
+use crate::{ConnectError, CryptoInfo, TryConnectError};
 
 pin_project_lite::pin_project! {
-    pub struct KTlsClientStream<IO> {
+    pub struct KTlsServerStream<IO> {
         #[pin]
-        stream: KTlsStreamImpl<IO, KernelConnection<ClientConnectionData>>
+        stream: KTlsStreamImpl<IO, KernelConnection<ServerConnectionData>>
     }
 }
 
-impl<IO> KTlsClientStream<IO>
+impl<IO> KTlsServerStream<IO>
 where
     IO: AsyncWrite + AsyncRead + AsRawFd,
 {
     pub fn from_unbuffered_connnection(
         socket: IO,
-        conn: UnbufferedClientConnection,
-    ) -> Result<Self, TryConnectError<IO, UnbufferedClientConnection>> {
+        conn: UnbufferedServerConnection,
+    ) -> Result<Self, TryConnectError<IO, UnbufferedServerConnection>> {
         // We attempt to set up the TLS ULP before doing anything else so that
         // we can indicate that the kernel doesn't support kTLS before returning
         // any other error.
@@ -44,19 +43,19 @@ where
             });
         }
 
-        // TODO: Validate that the negotiated connection is actually
-        //       supported by kTLS on the current machine.
-
         Ok(Self::from_unbuffered_connnection_with_tls_ulp_enabled(
-            socket, conn,
+            socket,
+            Vec::new(),
+            conn,
         )?)
     }
 
-    /// Create a new `KTlsClientStream` from a socket that already has had the TLS ULP
+    /// Create a new `KTlsServerStream` from a socket that already has had the TLS ULP
     /// enabled on it.
-    fn from_unbuffered_connnection_with_tls_ulp_enabled(
+    pub fn from_unbuffered_connnection_with_tls_ulp_enabled(
         socket: IO,
-        conn: UnbufferedClientConnection,
+        early_data: Vec<u8>,
+        conn: UnbufferedServerConnection,
     ) -> Result<Self, ConnectError> {
         let (secrets, kconn) = match conn.dangerous_into_kernel_connection() {
             Ok(secrets) => secrets,
@@ -75,12 +74,12 @@ where
             .map_err(ConnectError::IO)?;
 
         Ok(Self {
-            stream: KTlsStreamImpl::new(socket, Vec::new(), kconn),
+            stream: KTlsStreamImpl::new(socket, early_data, kconn),
         })
     }
 }
 
-impl<IO> AsyncRead for KTlsClientStream<IO>
+impl<IO> AsyncRead for KTlsServerStream<IO>
 where
     IO: AsyncWrite + AsyncRead + AsRawFd,
 {
@@ -93,7 +92,7 @@ where
     }
 }
 
-impl<IO> AsyncWrite for KTlsClientStream<IO>
+impl<IO> AsyncWrite for KTlsServerStream<IO>
 where
     IO: AsyncWrite + AsyncRead + AsRawFd,
 {
@@ -126,7 +125,7 @@ where
     }
 }
 
-impl<IO> AsRawFd for KTlsClientStream<IO>
+impl<IO> AsRawFd for KTlsServerStream<IO>
 where
     IO: AsRawFd,
 {
