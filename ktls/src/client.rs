@@ -15,7 +15,7 @@ use crate::{ConnectError, TryConnectError};
 pin_project_lite::pin_project! {
     pub struct KTlsClientStream<IO> {
         #[pin]
-        stream: KTlsStreamImpl<IO, KernelConnection<ClientConnectionData>>
+        pub(crate) stream: KTlsStreamImpl<IO, KernelConnection<ClientConnectionData>>
     }
 }
 

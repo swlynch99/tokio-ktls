@@ -35,7 +35,6 @@ pin_project_lite::pin_project! {
 
 impl<IO, Conn> KTlsStreamImpl<IO, Conn>
 where
-    IO: AsyncRead + AsyncWrite + AsRawFd,
     Conn: ?Sized,
     StreamData<Conn>: StreamSide,
 {
@@ -60,6 +59,43 @@ where
                 offset: 0,
                 conn,
             }),
+        }
+    }
+
+    pub(crate) fn into_side(
+        self,
+    ) -> Side<KTlsStreamImpl<IO, KernelClientConnection>, KTlsStreamImpl<IO, KernelServerConnection>>
+    {
+        let Self {
+            socket,
+            state,
+            data,
+        } = self;
+
+        match data.into_side() {
+            Side::Client(data) => Side::Client(KTlsStreamImpl {
+                socket,
+                state,
+                data,
+            }),
+            Side::Server(data) => Side::Server(KTlsStreamImpl {
+                socket,
+                state,
+                data,
+            }),
+        }
+    }
+}
+
+impl<IO, Conn> KTlsStreamImpl<IO, Conn>
+where
+    Conn: DynConn + 'static,
+{
+    pub(crate) fn into_dyn(self) -> KTlsStreamImpl<IO, dyn DynConn> {
+        KTlsStreamImpl {
+            socket: self.socket,
+            state: self.state,
+            data: self.data,
         }
     }
 }
@@ -625,6 +661,7 @@ where
 impl<IO, Conn> AsRawFd for KTlsStreamImpl<IO, Conn>
 where
     IO: AsRawFd,
+    Conn: ?Sized,
 {
     fn as_raw_fd(&self) -> RawFd {
         self.socket.as_raw_fd()
@@ -682,6 +719,10 @@ pub(crate) trait StreamSide: 'static {
     fn as_side_mut(
         &mut self,
     ) -> Side<&mut StreamData<KernelClientConnection>, &mut StreamData<KernelServerConnection>>;
+
+    fn into_side(
+        self: Box<Self>,
+    ) -> Side<Box<StreamData<KernelClientConnection>>, Box<StreamData<KernelServerConnection>>>;
 }
 
 impl StreamSide for StreamData<KernelClientConnection> {
@@ -694,6 +735,13 @@ impl StreamSide for StreamData<KernelClientConnection> {
     fn as_side_mut(
         &mut self,
     ) -> Side<&mut StreamData<KernelClientConnection>, &mut StreamData<KernelServerConnection>>
+    {
+        Side::Client(self)
+    }
+
+    fn into_side(
+        self: Box<Self>,
+    ) -> Side<Box<StreamData<KernelClientConnection>>, Box<StreamData<KernelServerConnection>>>
     {
         Side::Client(self)
     }
@@ -712,6 +760,76 @@ impl StreamSide for StreamData<KernelServerConnection> {
     {
         Side::Server(self)
     }
+
+    fn into_side(
+        self: Box<Self>,
+    ) -> Side<Box<StreamData<KernelClientConnection>>, Box<StreamData<KernelServerConnection>>>
+    {
+        Side::Server(self)
+    }
+}
+
+impl StreamSide for StreamData<dyn DynConn> {
+    fn as_side(
+        &self,
+    ) -> Side<&StreamData<KernelClientConnection>, &StreamData<KernelServerConnection>> {
+        match self.conn.side() {
+            // SAFETY: The implementor of DynConn guarantees that it is safe to downcast here.
+            Side::Client(_) => Side::Client(unsafe { &*(self as *const Self as *const _) }),
+            Side::Server(_) => Side::Server(unsafe { &*(self as *const Self as *const _) }),
+        }
+    }
+
+    fn as_side_mut(
+        &mut self,
+    ) -> Side<&mut StreamData<KernelClientConnection>, &mut StreamData<KernelServerConnection>>
+    {
+        match self.conn.side() {
+            // SAFETY: The implementor of DynConn guarantees that it is safe to downcast here.
+            Side::Client(_) => Side::Client(unsafe { &mut *(self as *mut Self as *mut _) }),
+            Side::Server(_) => Side::Server(unsafe { &mut *(self as *mut Self as *mut _) }),
+        }
+    }
+
+    fn into_side(
+        self: Box<Self>,
+    ) -> Side<Box<StreamData<KernelClientConnection>>, Box<StreamData<KernelServerConnection>>>
+    {
+        // SAFETY: The implementation of DynConn guarantees that it is safe to downcast here.
+        match self.conn.side() {
+            Side::Client(_) => {
+                Side::Client(unsafe { Box::from_raw(Box::into_raw(self) as *mut _) })
+            }
+            Side::Server(_) => {
+                Side::Server(unsafe { Box::from_raw(Box::into_raw(self) as *mut _) })
+            }
+        }
+    }
+}
+
+// SAFETY: We are a `KernelClientConnection` so it is safe `&dyn DynConn` references to us
+//         to be downcasted.
+unsafe impl DynConn for KernelClientConnection {
+    fn side(&self) -> Side<(), ()> {
+        Side::Client(())
+    }
+}
+
+// SAFETY: We are a `KernelServerConnection` so it is safe `&dyn DynConn` references to us
+//         to be downcasted.
+unsafe impl DynConn for KernelServerConnection {
+    fn side(&self) -> Side<(), ()> {
+        Side::Server(())
+    }
+}
+
+/// A trait that indicates which side of the connection this instance is.
+///
+/// # Safety
+/// Depending on what `side()` returns, it must be safe to downcast this trait
+/// to either a [`KernelClientConnection`] or a [`KernelServerConnection`].
+pub(crate) unsafe trait DynConn {
+    fn side(&self) -> Side<(), ()>;
 }
 
 bitflags::bitflags! {
@@ -778,7 +896,8 @@ impl From<PeerMisbehaved> for KTlsStreamError {
     }
 }
 
-pub(crate) enum Side<Client, Server> {
+/// An enum splitting things by connection side.
+pub enum Side<Client, Server> {
     Client(Client),
     Server(Server),
 }
