@@ -11,7 +11,7 @@ use crate::{KTlsClientStream, KTlsServerStream, Side};
 pin_project_lite::pin_project! {
     /// A wrapper around an `IO` that takes care of managing kTLS state for
     /// its underlying fd.
-    /// 
+    ///
     /// This is the generic version of [`KTlsClientStream`] and [`KTlsServerStream`].
     /// It cannot be constructed directly. Instead, construct on of the two more
     /// specific streams above and then convert them into [`KTlsStream`].

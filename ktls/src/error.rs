@@ -1,21 +1,26 @@
 use std::{fmt, io};
 
+use rustls::SupportedCipherSuite;
+
+use crate::suite::CipherProbeError;
+
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConnectError {
-    /// kTLS is not supported by the current kernel
+    /// kTLS is not supported by the current kernel.
     #[error("kTLS is not supported by the current kernel")]
     KTlsUnsupported,
 
     #[error("the negotiated cipher suite is not supported by kTLS")]
-    UnsupportedCipherSuite,
+    UnsupportedCipherSuite(SupportedCipherSuite),
 
     #[error("the peer closed the connection before the TLS handshake could be completed")]
-    PeerClosedBeforeHandshakeCompleted,
+    ConnectionClosedBeforeHandshakeCompleted,
 
     #[error("{0}")]
     IO(#[source] io::Error),
 
-    #[error("failed to create rustls client connection: {0}")]
+    #[error("failed to create rustls connection: {0}")]
     Config(#[source] rustls::Error),
 
     #[error("an error occurred during the handshake: {0}")]
@@ -23,6 +28,15 @@ pub enum ConnectError {
 
     #[error("unable to extract connection secrets from rustls connection: {0}")]
     ExtractSecrets(#[source] rustls::Error),
+}
+
+impl From<ConnectError> for io::Error {
+    fn from(error: ConnectError) -> Self {
+        match error {
+            ConnectError::IO(error) => error,
+            _ => io::Error::other(error),
+        }
+    }
 }
 
 #[derive(thiserror::Error)]
@@ -49,5 +63,17 @@ impl<IO, Conn> From<ConnectError> for TryConnectError<IO, Conn> {
             socket: None,
             conn: None,
         }
+    }
+}
+
+impl<IO, Conn> From<TryConnectError<IO, Conn>> for ConnectError {
+    fn from(value: TryConnectError<IO, Conn>) -> Self {
+        value.error
+    }
+}
+
+impl<IO, Conn> From<TryConnectError<IO, Conn>> for io::Error {
+    fn from(error: TryConnectError<IO, Conn>) -> Self {
+        error.error.into()
     }
 }

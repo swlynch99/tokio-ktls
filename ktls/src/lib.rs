@@ -42,11 +42,12 @@ mod generic;
 mod protocol;
 mod server;
 mod stream;
+mod suite;
 
 pub use crate::client::KTlsClientStream;
 pub use crate::error::{ConnectError, TryConnectError};
 pub use crate::generic::KTlsStream;
-pub use crate::server::KTlsServerStream;
+pub use crate::server::{KTlsAcceptor, KTlsServerStream};
 pub use crate::stream::{KTlsStreamError, Side};
 
 #[derive(Debug, Default)]
