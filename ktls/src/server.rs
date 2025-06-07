@@ -168,7 +168,7 @@ impl KTlsAcceptor {
             }
         }
 
-        KTlsServerStream::from_unbuffered_connnection_validate(socket, early, conn).await
+        KTlsServerStream::from_unbuffered_connection_validate(socket, early, conn).await
     }
 }
 
@@ -252,9 +252,9 @@ where
 
         let suite = kconn.negotiated_cipher_suite();
         let tx = CryptoInfo::from_rustls(suite, secrets.tx)
-            .map_err(|_| ConnectError::UnsupportedCipherSuite)?;
+            .map_err(|_| ConnectError::UnsupportedCipherSuite(suite))?;
         let rx = CryptoInfo::from_rustls(suite, secrets.rx)
-            .map_err(|_| ConnectError::UnsupportedCipherSuite)?;
+            .map_err(|_| ConnectError::UnsupportedCipherSuite(suite))?;
 
         crate::ffi::setup_tls_info(socket.as_raw_fd(), Direction::Tx, tx)
             .map_err(ConnectError::IO)?;

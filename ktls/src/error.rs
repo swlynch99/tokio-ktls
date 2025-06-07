@@ -2,8 +2,6 @@ use std::{fmt, io};
 
 use rustls::SupportedCipherSuite;
 
-use crate::suite::CipherProbeError;
-
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConnectError {

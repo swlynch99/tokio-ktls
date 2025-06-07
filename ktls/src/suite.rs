@@ -1,38 +1,39 @@
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::AtomicU32;
-use std::sync::OnceLock;
 
 use ktls_sys::bindings as sys;
-use rustls::CipherSuite;
+use rustls::SupportedCipherSuite;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::OnceCell;
 
 use crate::ffi::{CryptoInfo, Direction};
 use crate::{KtlsCipherSuite, KtlsCipherType, KtlsVersion};
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct CompatibleCiphers {
     pub tls12: CompatibleCiphersForVersion,
     pub tls13: CompatibleCiphersForVersion,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct CompatibleCiphersForVersion {
     pub aes_gcm_128: bool,
     pub aes_gcm_256: bool,
     pub chacha20_poly1305: bool,
 }
 
-static COMPATIBLE: OnceCell<CompatibleCiphers> = OnceCell::new();
+static COMPATIBLE: OnceCell<CompatibleCiphers> = OnceCell::const_new();
 
 impl CompatibleCiphers {
     /// List compatible ciphers. This listens on a TCP socket and blocks for a
     /// little while. Do once at the very start of a program. Should probably be
     /// behind a lazy_static / once_cell
     pub async fn new() -> Result<Self, CipherProbeError> {
-        COMPATIBLE.get_or_try_init(Self::probe()).await
+        COMPATIBLE
+            .get_or_try_init(Self::probe)
+            .await
+            .map(Self::clone)
     }
 
     /// Returns true if we're reasonably confident that functions like
@@ -131,32 +132,41 @@ impl CompatibleCiphers {
             KtlsVersion::TLS13 => crate::ffi::TLS_1_3_VERSION_NUMBER,
         };
 
-        let crypto_info = match kcs.typ {
+        let crypto_info = match suite {
             KtlsCipherType::AesGcm128 => {
                 CryptoInfo::AesGcm128(sys::tls12_crypto_info_aes_gcm_128 {
                     info: sys::tls_crypto_info {
-                        version: ffi_version,
+                        version,
                         cipher_type: sys::TLS_CIPHER_AES_GCM_128 as _,
                     },
-                    ..Default::default()
+                    iv: Default::default(),
+                    key: Default::default(),
+                    salt: Default::default(),
+                    rec_seq: Default::default(),
                 })
             }
             KtlsCipherType::AesGcm256 => {
                 CryptoInfo::AesGcm256(sys::tls12_crypto_info_aes_gcm_256 {
                     info: sys::tls_crypto_info {
-                        version: ffi_version,
+                        version,
                         cipher_type: sys::TLS_CIPHER_AES_GCM_256 as _,
                     },
-                    ..Default::default()
+                    iv: Default::default(),
+                    key: Default::default(),
+                    salt: Default::default(),
+                    rec_seq: Default::default(),
                 })
             }
             KtlsCipherType::Chacha20Poly1305 => {
                 CryptoInfo::Chacha20Poly1305(sys::tls12_crypto_info_chacha20_poly1305 {
                     info: sys::tls_crypto_info {
-                        version: ffi_version,
+                        version,
                         cipher_type: sys::TLS_CIPHER_CHACHA20_POLY1305 as _,
                     },
-                    ..Default::default()
+                    iv: Default::default(),
+                    key: Default::default(),
+                    salt: Default::default(),
+                    rec_seq: Default::default(),
                 })
             }
         };
@@ -185,58 +195,4 @@ pub enum CipherProbeError {
 
     #[error("failed to set up the TLS upper-level-protocol on the socket: {0}")]
     Ulp(#[source] io::Error),
-}
-
-fn sample_cipher_setup(sock: &TcpStream, cipher_suite: SupportedCipherSuite) -> Result<(), Error> {
-    let kcs = match KtlsCipherSuite::try_from(cipher_suite) {
-        Ok(kcs) => kcs,
-        Err(_) => panic!("unsupported cipher suite"),
-    };
-
-    let ffi_version = match kcs.version {
-        KtlsVersion::TLS12 => ffi::TLS_1_2_VERSION_NUMBER,
-        KtlsVersion::TLS13 => ffi::TLS_1_3_VERSION_NUMBER,
-    };
-
-    let crypto_info = match kcs.typ {
-        KtlsCipherType::AesGcm128 => CryptoInfo::AesGcm128(sys::tls12_crypto_info_aes_gcm_128 {
-            info: sys::tls_crypto_info {
-                version: ffi_version,
-                cipher_type: sys::TLS_CIPHER_AES_GCM_128 as _,
-            },
-            iv: Default::default(),
-            key: Default::default(),
-            salt: Default::default(),
-            rec_seq: Default::default(),
-        }),
-        KtlsCipherType::AesGcm256 => CryptoInfo::AesGcm256(sys::tls12_crypto_info_aes_gcm_256 {
-            info: sys::tls_crypto_info {
-                version: ffi_version,
-                cipher_type: sys::TLS_CIPHER_AES_GCM_256 as _,
-            },
-            iv: Default::default(),
-            key: Default::default(),
-            salt: Default::default(),
-            rec_seq: Default::default(),
-        }),
-        KtlsCipherType::Chacha20Poly1305 => {
-            CryptoInfo::Chacha20Poly1305(sys::tls12_crypto_info_chacha20_poly1305 {
-                info: sys::tls_crypto_info {
-                    version: ffi_version,
-                    cipher_type: sys::TLS_CIPHER_CHACHA20_POLY1305 as _,
-                },
-                iv: Default::default(),
-                key: Default::default(),
-                salt: Default::default(),
-                rec_seq: Default::default(),
-            })
-        }
-    };
-    let fd = sock.as_raw_fd();
-
-    setup_ulp(fd).map_err(Error::UlpError)?;
-
-    setup_tls_info(fd, ffi::Direction::Tx, crypto_info).map_err(Error::TlsCryptoInfoError)?;
-
-    Ok(())
 }
